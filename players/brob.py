@@ -1,64 +1,29 @@
-"""Adaptive, information-aware player.
+"""Selective commitment player with multi-factor evaluation.
 
-Core play logic: minimize gap (proven by Committer to be the strongest
-single heuristic). On top of that, adds smart draw selection (EV comparison
-against deck), opponent-aware discarding, and tempo management.
+Architecture: independent evaluators each score a candidate play from their
+own perspective (gap, chain, momentum, bonus, opening EV, suit target, face).
+The player combines these scores with tunable weights.
 
-See BROB_POLICY.md for full decision policy.
+See brob_policy.md for full decision policy.
 """
 
 from classes import *
 from utils import *
 from players.brob_utils import (
-    playable_in_hand,
-    expedition_score,
-    expedition_projected_score,
-    cards_to_bonus,
-    suit_potential,
     game_phase,
-    card_value_for_me,
+    score_play,
+    hand_deadwood,
+    discard_danger,
+    smart_discard_score,
+    select_target_suits,
+    opponent_needs_from_discard,
     best_available_draw,
     deny_draw_value,
-    hand_deadwood,
-    smart_discard_score,
-    discard_danger,
-    opponent_committed_suits,
-    opponent_needs_from_discard,
-    should_stall,
-    contract_value,
-    remaining_above,
-    deck_cards_remaining,
     tempo_advantage,
+    stall_push_modifier,
+    ev_open_now,
+    card_value_for_me,
 )
-
-
-def minimize_gap_scored(cards, flags, me):
-    """Return cards sorted by gap size (ascending), with gap info.
-    Like Committer's minimize_gap but returns all candidates scored."""
-    results = []
-    for c in cards:
-        baseline = -1
-        played = flags[c[0]].played[me]
-        if played:
-            baseline = int(played[-1][1])
-
-        values_left = [x for x in CARDS if int(x) >= baseline]
-        if baseline == 0:
-            values_left = values_left[1:]
-
-        opponent_played = flags[c[0]].played[1 - me]
-        discards = flags[c[0]].discards[:-1]
-
-        for other_c in opponent_played + discards:
-            v = other_c[1]
-            if v in values_left:
-                values_left.remove(v)
-
-        gap = values_left.index(c[1]) if c[1] in values_left else len(values_left)
-        results.append((c, gap))
-
-    results.sort(key=lambda x: x[1])
-    return results
 
 
 class Brob(Player):
@@ -74,186 +39,121 @@ class Brob(Player):
 
         playable = [c for c in hand if is_playable(c, flags[c[0]].played[me])]
 
-        # Filter: only play into expeditions worth committing to
-        worth_playing = self._filter_worth_playing(playable, flags, hand, me, phase)
+        # Score all playable cards with multi-factor evaluator
+        if playable:
+            scored = [(c, score_play(c, flags, hand, me)) for c in playable]
+            # score_play returns (total, breakdown)
+            scored.sort(key=lambda x: x[1][0], reverse=True)
 
-        if worth_playing:
-            card = self._choose_play(worth_playing, flags, hand, me, phase)
-            draw = self._choose_draw_after_play(card, flags, hand, me, phase)
-            return card, False, draw
-        else:
-            card = self._choose_discard(hand, flags, me)
-            draw = self._choose_draw_after_discard(card, flags, hand, me, phase)
-            return card, True, draw
+            best_card, (best_score, best_breakdown) = scored[0]
 
-    def _filter_worth_playing(self, playable, flags, hand, me, phase):
-        """Filter out plays that would open clearly bad expeditions.
-        Always allow extending existing expeditions. For new ones, apply
-        a light gate: just need *some* support to justify opening."""
-        worth = []
-        for card in playable:
-            suit = card[0]
-            played = flags[suit].played[me]
+            # Should we play the best card or discard?
+            # Play if score is above a phase-adjusted threshold.
+            # Early game: more permissive (threshold lower)
+            # Late game: more demanding for new expeditions, but always extend open ones
+            is_new_expedition = not flags[best_card[0]].played[me]
 
-            # Already started: always worth extending
-            if played:
-                worth.append(card)
-                continue
+            if is_new_expedition:
+                # For new expeditions: check the opening evaluator specifically.
+                # If the EV-based opening score is strongly negative, don't open.
+                opening_signal = best_breakdown.get('opening', 0)
+                # Threshold: mildly negative is OK early, stricter late
+                open_threshold = -2.0 + phase * 1.0  # -2.0 early, -1.0 late
+                if opening_signal < open_threshold:
+                    # Opening EV is bad — skip to next best or discard
+                    # Try to find an extension play instead
+                    extensions = [(c, s) for c, (s, b) in scored
+                                  if flags[c[0]].played[me]]
+                    if extensions:
+                        best_card = extensions[0][0]
+                        best_score = extensions[0][1]
+                        is_new_expedition = False
+                    else:
+                        best_score = -999  # Force discard
 
-            # New expedition: need at least some reason to open
-            hand_in_suit = [c for c in hand if c[0] == suit]
+                play_threshold = -999  # Already gated above
+            else:
+                # Extending existing: almost always do it
+                play_threshold = -30.0
 
-            # Opening with a single high card (6+) and nothing else is bad —
-            # it starts an expedition that's hard to fill
-            if len(hand_in_suit) == 1 and card[1] >= '6':
-                continue
+            if best_score >= play_threshold:
+                draw = self._choose_draw(best_card, best_card[0], False,
+                                         flags, hand, me, phase)
+                return best_card, False, draw
 
-            # Late game: don't open unless you have real depth
-            if phase >= 0.6 and len(hand_in_suit) < 3:
-                continue
+        # Nothing worth playing — discard
+        card = self._choose_discard(hand, flags, me, phase)
+        draw = self._choose_draw(card, card[0], True, flags, hand, me, phase)
+        return card, True, draw
 
-            worth.append(card)
+    # ------------------------------------------------------------------
+    # Discard selection
+    # ------------------------------------------------------------------
 
-        return worth
-
-    def _choose_play(self, playable, flags, hand, me, phase):
-        """Pick the best card using gap as primary score + strategic bonuses.
-        Gap is weighted heavily but not absolute — depth and bonus proximity
-        can override a 1-gap difference."""
-        scored_gaps = minimize_gap_scored(playable, flags, me)
-
-        best_card = scored_gaps[0][0]
-        best_score = -999
-
-        for card, gap in scored_gaps:
-            score = self._combined_play_score(card, gap, flags, hand, me, phase)
-            if score > best_score:
-                best_score = score
-                best_card = card
-
-        return best_card
-
-    def _combined_play_score(self, card, gap, flags, hand, me, phase):
-        """Combined score: gap dominates, but strategic factors can tip close calls."""
-        suit = card[0]
-        played = flags[suit].played[me]
-        score = 0.0
-
-        # Gap is the dominant factor: each gap point costs 10 score.
-        # Strategic bonuses max out around 5-6, so they can only override
-        # a 0-gap vs 1-gap decision at best.
-        score -= gap * 10
-
-        # Extending existing expeditions
-        if played:
-            score += 2
-            score += len(played) * 0.3
-
-        # Contracts multiplier bonus
-        n_contracts = sum(1 for c in played if c[1] == '0')
-        score += n_contracts * 1.5
-
-        # 8-card bonus chase
-        needed = cards_to_bonus(suit, flags, me)
-        if 0 < needed <= 3:
-            hand_in_suit = playable_in_hand(suit, hand, flags, me)
-            remaining = remaining_above(suit, flags, hand, me)
-            total_available = len(played) + len(hand_in_suit) + len(remaining)
-            if total_available >= BONUS_THRESHOLD:
-                score += (4 - needed) * 2
-
-        # Hand density: slight preference for suits with more cards in hand
-        hand_in_suit = [c for c in hand if c[0] == suit]
-        score += len(hand_in_suit) * 0.5
-
-        # Face value (tiny tiebreaker)
-        if card[1] != '0':
-            score += (int(card[1]) + 1) * 0.05
-
-        return score
-
-    def _choose_discard(self, hand, flags, me):
+    def _choose_discard(self, hand, flags, me, phase):
         """Pick the best card to discard."""
-        deadwood = hand_deadwood(hand, flags, me)
+        targets = select_target_suits(hand, flags, me)
 
+        # Deadwood first (unplayable cards)
+        deadwood = hand_deadwood(hand, flags, me)
         if deadwood:
-            # Among deadwood, pick least dangerous
             deadwood.sort(key=lambda c: discard_danger(c, flags, me))
             return deadwood[0]
 
-        # Score all cards
+        # Prefer discarding non-target suit cards
+        non_target = [c for c in hand if c[0] not in targets]
+        if non_target:
+            non_target.sort(key=lambda c: smart_discard_score(c, flags, hand, me))
+            best = non_target[0]
+            if discard_danger(best, flags, me) < 8:
+                return best
+
+        # Full hand scoring
         scored = [(c, smart_discard_score(c, flags, hand, me)) for c in hand]
         scored.sort(key=lambda x: x[1])
 
-        # Avoid feeding the opponent if possible
+        # Avoid feeding opponent
         opp_needs = set(c[0] for c in opponent_needs_from_discard(flags, me))
-        best_card, best_score = scored[0]
+        best_card, best_sc = scored[0]
+
         if best_card[0] in opp_needs and len(scored) > 1:
             for card, sc in scored[1:]:
                 if card[0] not in opp_needs:
                     return card
-                if sc - best_score < 3:
-                    return card
-
+                if sc - best_sc > 5:
+                    break
         return best_card
 
-    def _choose_draw_after_play(self, played_card, flags, hand, me, phase):
-        """Choose draw source after playing a card.
-        Uses Committer-style logic: draw from discard if it improves hand
-        more than the second-best play option."""
+    # ------------------------------------------------------------------
+    # Draw selection
+    # ------------------------------------------------------------------
+
+    def _choose_draw(self, action_card, action_suit, is_discard,
+                     flags, hand, me, phase):
+        """Compare discard pile draws against deck EV, modulated by tempo."""
         candidates, deck_ev = best_available_draw(flags, hand, me)
 
-        # Also consider denial draws
+        # Denial draws
         denial = self._get_denial_draws(flags, hand, me)
-
-        all_draws = [(c, v) for c, v in candidates]
         seen = set(c for c, v in candidates)
+        all_draws = list(candidates)
         for c, v in denial:
             if c not in seen:
                 all_draws.append((c, v * 0.5))
 
-        # Tempo: if ahead and want to push, prefer deck
-        advantage = tempo_advantage(flags, hand, me)
-        stalling = should_stall(flags, hand, me)
+        # Can't draw from discarded suit
+        if is_discard:
+            all_draws = [(c, v) for c, v in all_draws if c[0] != action_suit]
 
-        if phase > 0.5 and advantage > 20 and not stalling:
-            all_draws = [(c, v) for c, v in all_draws if v > deck_ev * 1.5]
+        # Tempo modifier
+        modifier = stall_push_modifier(flags, hand, me)
+        threshold = deck_ev * modifier
+        all_draws = [(c, v) for c, v in all_draws if v > threshold]
 
-        # If stalling, accept any playable discard draw
-        if stalling and not all_draws:
+        # Hard stall: accept any playable discard
+        if not all_draws and modifier < 0.7:
             for suit in SUITS:
-                discards = flags[suit].discards
-                if discards:
-                    top = discards[-1]
-                    if is_playable(top, flags[suit].played[me]):
-                        all_draws.append((top, 0.1))
-
-        if all_draws:
-            all_draws.sort(key=lambda x: x[1], reverse=True)
-            return all_draws[0][0]
-
-        return 'deck'
-
-    def _choose_draw_after_discard(self, discarded, flags, hand, me, phase):
-        """Choose draw source after discarding. Can't draw from discarded suit."""
-        discard_suit = discarded[0]
-
-        candidates, deck_ev = best_available_draw(flags, hand, me)
-        denial = self._get_denial_draws(flags, hand, me)
-
-        all_draws = [(c, v) for c, v in candidates]
-        seen = set(c for c, v in candidates)
-        for c, v in denial:
-            if c not in seen:
-                all_draws.append((c, v * 0.5))
-
-        # Filter out discarded suit
-        all_draws = [(c, v) for c, v in all_draws if c[0] != discard_suit]
-
-        stalling = should_stall(flags, hand, me)
-        if stalling and not all_draws:
-            for suit in SUITS:
-                if suit == discard_suit:
+                if is_discard and suit == action_suit:
                     continue
                 discards = flags[suit].discards
                 if discards:
@@ -268,7 +168,7 @@ class Brob(Player):
         return 'deck'
 
     def _get_denial_draws(self, flags, hand, me):
-        """Find discard pile cards worth drawing to deny the opponent."""
+        """Discard pile cards worth drawing to deny opponent."""
         denial = []
         for suit in SUITS:
             discards = flags[suit].discards
