@@ -14,8 +14,8 @@ class Discarder(Player):
     def play(self, r):
         me = r.whose_turn
 
-        cards = r.h[me].cards
-        playable_cards = [c for c in cards 
+        cards = r.hand.cards
+        playable_cards = [c for c in cards
                           if is_playable(c, r.flags[c[0]].played[me])]
 
         if playable_cards:

@@ -22,7 +22,7 @@ class Granny(Player):
 
     def play(self, r):
         me = r.whose_turn
-        hand = r.h[me].cards
+        hand = r.hand.cards
 
         playable_cards = [c for c in hand
                           if is_playable(c, r.flags[c[0]].played[me])]

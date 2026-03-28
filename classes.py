@@ -26,6 +26,20 @@ class Player():
         raise Exception('Must override this method')
 
 
+class PlayerView():
+    """A restricted view of the game state for a specific player.
+
+    Prevents bots from accessing the opponent's hand or the deck contents.
+    """
+    __slots__ = ('whose_turn', 'flags', 'hand', 'deck_size')
+
+    def __init__(self, round, player_id):
+        self.whose_turn = player_id
+        self.flags = round.flags
+        self.hand = round.h[player_id]
+        self.deck_size = len(round.deck)
+
+
 class Round():
     def __init__(self, players, names, verbose=False):
         self.flags = {s: self.Flag() for s in SUITS}
@@ -37,10 +51,12 @@ class Round():
         # Opposite of Battle Line naming convention; TODO: revisit?
         self.deck = [s + c for s in SUITS for c in CARDS]
         random.shuffle(self.deck)
-        [h.add(self.draw()) for h in self.h for i in range(HAND_SIZE)]
+        for h in self.h:
+            h.cards.extend(self.deck[-HAND_SIZE:])
+            del self.deck[-HAND_SIZE:]
 
     def draw(self, target_name='deck'):
-        if target_name == 'deck':  # Magic string 
+        if target_name == 'deck':  # Magic string
             draw_pile = self.deck
         else:
             suit = target_name[0]
@@ -54,7 +70,7 @@ class Round():
     def execute_play(self, player):
         me = self.whose_turn
         h = self.h[me]
-        card, is_discard, draw = player.play(self)
+        card, is_discard, draw = player.play(PlayerView(self, me))
 
         suit = card[0]
 
@@ -135,12 +151,16 @@ class Round():
 
 
     class Flag():  # Named to match Battle Line
+        __slots__ = ('played', 'discards')
+
         def __init__(self):
             self.played = [[], []]
             self.discards = []  # Face-up draw pile
 
 
     class Hand():
+        __slots__ = ('cards', 'seat', 'name')
+
         def __init__(self, seat, name):
             self.cards = []
             self.seat = seat

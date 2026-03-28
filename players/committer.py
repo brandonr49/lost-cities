@@ -21,8 +21,8 @@ class Committer(Player):
         possible_draws = playable_draws(r.flags, me)
         best_draw, draw_gap, _ = minimize_gap(possible_draws, r.flags, me)
 
-        cards = r.h[me].cards
-        playable_cards = [c for c in cards 
+        cards = r.hand.cards
+        playable_cards = [c for c in cards
                              if is_playable(c, r.flags[c[0]].played[me])]
 
         if playable_cards:
